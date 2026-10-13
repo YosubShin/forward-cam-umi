@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "backend": "avfoundation",
+  "cameras": [
+    {
+      "role": "b0587",
+      "device_id": "REPLACE_WITH_FORWARD_DEVICE_ID",
+      "name": "REPLACE_WITH_DEVICE_NAME",
+      "width": 3840,
+      "height": 2160,
+      "fps": 25,
+      "rotation_degrees": 0
+    },
+    {
+      "role": "b0587b",
+      "device_id": "REPLACE_WITH_HEAD_DEVICE_ID",
+      "name": "REPLACE_WITH_DEVICE_NAME",
+      "width": 3840,
+      "height": 2160,
+      "fps": 25,
+      "rotation_degrees": 0
+    },
+    {
+      "role": "fish",
+      "device_id": "REPLACE_WITH_WRIST_DEVICE_ID",
+      "name": "REPLACE_WITH_DEVICE_NAME",
+      "width": 1920,
+      "height": 1080,
+      "fps": 30,
+      "rotation_degrees": 0
+    }
+  ]
+}

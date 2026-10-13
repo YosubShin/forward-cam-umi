@@ -24,6 +24,10 @@ sdl2 device renders black on this box). OVERLAY=0 disables the marker
 overlay. The recording stays an untouched stream copy either way, and a
 dying/closed viewer never stops the recording.
 Ctrl-C stops cleanly.
+
+On macOS the same entry point uses saved AVFoundation IDs and canonical
+image rotation. It re-encodes high-quality MJPEG (not sensor passthrough);
+actual capture times are in _ts.json. See scripts/README.md for limitations.
 """
 import json
 import os
@@ -36,6 +40,9 @@ import time
 if len(sys.argv) < 2 or any(a in ("-h", "--help") for a in sys.argv[1:]):
     print(__doc__.strip())
     sys.exit(0 if len(sys.argv) >= 2 else 2)
+if sys.platform == "darwin":
+    from recording_macos import main as record_macos
+    sys.exit(record_macos())
 name = sys.argv[1]
 dev = sys.argv[2] if len(sys.argv) > 2 else "/dev/video0"
 RES = sys.argv[3] if len(sys.argv) > 3 else "1920x1080"

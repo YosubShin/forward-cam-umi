@@ -19,6 +19,147 @@ sudo apt install ffmpeg v4l-utils            # ffmpeg/ffprobe + v4l2-ctl
 ```
 Linux with the cameras on USB (UVC). Tested with Python 3.12.
 
+### macOS adapter (experimental)
+
+macOS uses the same terminal interaction and **mpv/ffplay** preview as Linux.
+There is no separate Python GUI or Qt dependency. Install with Python 3.12:
+
+```sh
+brew install ffmpeg                       # includes ffplay; mpv is also supported
+python -m pip install -r scripts/requirements-macos.txt
+python scripts/cameras_setup.py --list --formats
+python scripts/cameras_setup.py --require-head
+```
+
+Like Linux setup, each device gets a preview, then the terminal asks for its
+role: `b0587` (forward), `b0587b` (head), `fish` (wrist), or `-` to skip.
+Use `r` to replay. Choose image rotation and recording mode, verify that mode,
+and confirm the physical camera. The identification preview uses a temporary
+small resolution; the saved recording mode defaults to the pilot settings.
+Existing bindings are backed up only after all required roles are verified;
+cancelling or failing setup keeps the old config.
+
+The macOS differences are limited to camera I/O and local configuration:
+AVFoundation device IDs replace V4L2 paths; capture validates native dimensions
+and normalizes 0°/180° rotation before analysis. Identical names are never used
+as identity fallbacks. Changing USB ports can change IDs; rerun setup and
+verify the physical cameras. Bindings remain in ignored
+`calib/cameras.macos.local.json`; measurements in `calib/*.local.json` stay local.
+Existing macOS configs are compatible and need no migration.
+
+```sh
+python scripts/cameras_setup.py --check-config --require-head
+python scripts/cameras_setup.py --preview head --seconds 15
+python scripts/focus_tune.py forward
+python scripts/focus_tune.py head --ref forward
+python scripts/focus_tune.py wrist
+```
+
+`focus_tune.py` shares the Linux measurement, layout and terminal controls:
+**q** quit, **r** reset peak, **n** next marker, **c** centre crop. Keep the
+**terminal focused**, not the player window. `--ref` opens both cameras at
+once and needs enough USB bandwidth. macOS selects each role's saved native
+resolution/FPS; `--size`, if supplied, must match it. Never rotate the normalized
+head-camera images again or reuse calibration from the opposite orientation.
+As in Linux, `edge px` aggregates workspace-tag edges when available, otherwise
+glove-marker edges; it is not necessarily the edge width of the selected crop.
+The crop uses source pixels; the external player's scaling controls its final
+on-screen size. Compare a stationary target under steady lighting.
+
+Close other camera apps before capture. Camera permission belongs to the
+terminal/app launching Python; allow it under System Settings → Privacy &
+Security → Camera. `--list` and `--check-config` do not open cameras.
+
+Intrinsics use the same `calibrate_uvc.py` collection and fitting loop as Linux.
+Pass a saved role instead of a V4L2 path and your own board measurements:
+
+```sh
+python scripts/calibrate_uvc.py forward --name B0587 --square-mm <measured> --marker-mm <measured>
+python scripts/calibrate_uvc.py head --name B0587b --square-mm <measured> --marker-mm <measured>
+python scripts/calibrate_uvc.py wrist --name fisheye_glove_<unit> --model rational --square-mm <measured> --marker-mm <measured>
+```
+
+Close the focus preview first. There is no calibration preview window: move
+the flat board through near/far, centre/corners and tilted poses, pause between
+moves, and watch the terminal's `collected N/45` counter. Ctrl-C during collection
+cancels without replacing previous results. Ten views are held out for validation. Camera
+mode/rotation and board measurements are saved with the JSON and NPZ outputs;
+`--refit` reuses that metadata without opening a camera (explicit board-size
+flags can correct an earlier measurement). Older NPZs without metadata still
+need their original board-size flags. Head-camera coordinates are already
+rotated before corner detection. Results/backups stay local under `calib/`.
+
+Currently adapted: **camera setup, focus inspection, live intrinsics, and
+glove/rehearsal recording**. Robot/teleop recording is still Linux-only.
+Exposure/gain control is not ported: keep light steady, check moving markers
+in a short take, and do not assume the Linux 0.2 ms exposure ritual ran.
+
+Start with a short three-camera rehearsal (close QuickTime/focus/calibration
+first). Hold the glove so forward/head see its ball and wrist sees its tips;
+the original recorded-frame marker pre-flight still applies. The 20 seconds
+start **after** pre-flight, so the total recording will be longer:
+
+```sh
+python scripts/record_session.py --cameras_only --dataset mac_smoke_01 --duration 20 --num_episodes 1 --no_preview
+python scripts/recording_check.py mac_smoke_01
+```
+
+This first test isolates capture/encoding throughput. Repeat with a new dataset
+name and `--preview_all` instead of `--no_preview` to validate the live viewers.
+Then use the same `--glove --dataset D --num_episodes N` commands and ENTER /
+`d` / `q` / optional `--width_holds` interaction as Linux. `--no_preview` turns
+off external mpv/ffplay windows; the macOS recording preview shows a main view
+and marker overlay (the Linux EEF zoom panel is not ported). `--config PATH`
+selects another local binding file; all cameras must have distinct exact IDs.
+
+The raw interface remains `<dataset>_<role>.mkv`, `_ts.json` (one `wall` value
+per decoded frame), `_meta.json`, and the unchanged glove episode/hold files.
+macOS has the following explicit differences:
+
+- AVFoundation delivers decoded pixels. They are rotated to the calibrated
+  orientation **before** encoding, then encoded as MJPEG at JPEG quality 95.
+  This is a lossy re-encode, not Linux's untouched camera JPEG stream copy.
+  Metadata records the device, dimensions, rate, rotation and codec path.
+- The native session PTS is converted to the CoreMedia host clock and anchored
+  to Unix time, matching the episode marks' `time.time()` clock. The video
+  container uses nominal fps; **`_ts.json` is the capture time source of truth**,
+  including gaps. No frames are synthesized to fill gaps. An observed system
+  clock jump aborts the take instead of silently misaligning episode marks.
+- Recording has a bounded FIFO separate from preview's latest-frame queue.
+  Its capacity absorbs up to one second of burst delivery, capped at 512 MiB
+  of queued BGR pixels per camera (21 frames at 4K, 31 at the saved 1080p
+  30.00003 fps mode). This is a queue payload limit, not a process-memory cap.
+  Starting another UVC stream can interrupt and then burst frame delivery to
+  an already running stream; a fixed eight-frame FIFO did not absorb this.
+  FFmpeg and the JPEG/mux consumer start before the blocking AVFoundation
+  startup call, so process initialization does not block the first frame and
+  frames can be drained while the session is still starting. No warm-up pixels
+  are injected; a muxer that receives no frames is cancelled. Shutdown
+  stops capture, drains the writer, then remuxes. Metadata includes startup
+  duration, buffer capacity, queue wait, encode/mux latency and callback
+  cadence for diagnosis. All received frames retain their original capture
+  timestamps; no startup frames are removed to make the queue look healthy.
+  FIFO overflow is fatal; native drops and timing gaps are reported. Closing
+  a viewer never stops capture. Each stream retains 60-second segments and a
+  timestamp journal until remux and frame-count checks succeed. Failed or
+  unfinished takes are preserved and cannot be silently reused. The session
+  stops if a recorder exits or remaining disk space cannot accommodate the
+  final remux copy plus a 2 GB reserve.
+- On macOS, timed rehearsals (`--duration`) budget disk space from the selected
+  cameras' resolution and fps: 0.5 compressed bytes/pixel, the requested
+  duration plus 30 seconds for startup, two video copies for remux, and a
+  2 GB reserve. This is an estimate; MJPEG size varies with the scene and the
+  runtime space check still applies. Untimed sessions retain the 30 GB floor.
+- `recording_check.py` checks raw transport, dimensions, frame/timestamp
+  counts, frame cadence and common time span, **not** optical synchronization,
+  marker coverage, or label accuracy. For hardware validation, show all views
+  a common visible event and compare its capture times (allowing frame-period
+  quantization); also inspect moving-marker detection. Run the later
+  `session_check.py` after geometry and offline detection are available.
+
+Daily bindings and generated capture/calibration data remain local. The
+macOS adapter contains no user-specific device IDs or physical measurements.
+
 ## 1. Measurements — one caliper reading per printed group
 
 Printers rescale by a few percent and the error does not announce itself:
@@ -108,6 +249,37 @@ python scripts/record_session.py --glove --dataset glove_yuan_01 --num_episodes 
 did, `q` finishes. Outputs in `data/raw/`: `<dataset>_<cam>.mkv` + `_ts.json`
 per camera and `<dataset>_glove_episodes.json` (boundaries).
 
+**Different physical wrist markers (Linux and macOS).** Copy the full unit
+marker map to `calib/marker_map_glove_<unit>.local.json` (git-ignored). Set
+`tips_dict` to `16h5` or `4x4`, and `tips` to the two jaw-marker IDs and their
+measured **black-edge lengths in mm**. For a 4x4 marker also listed in `tails`
+or `bases`, the sizes must agree. Do not reuse the old tips' size for a
+different print. Pass the map when recording:
+
+```sh
+python scripts/record_session.py --glove --dataset glove_test_01 --num_episodes 5 \
+  --marker-map calib/marker_map_glove_<unit>.local.json
+```
+
+This requires **both configured wrist IDs** at pre-flight, rejecting unrelated
+and ambiguous duplicate IDs. It saves the full map to
+`data/raw/<dataset>_marker_map.json`; retries reuse this snapshot. Changing
+the map requires a new dataset name. Without a map or snapshot, recording
+keeps the legacy any-16h5 wrist check.
+
+`detect_parallel.py` already writes both families; run it as usual.
+`session_check.py --unit <unit>` reads the snapshot automatically: 4x4 wrist
+markers use `_dodeca_detections.npz`, 16h5 uses `_tips16h5_detections.npz`.
+Missing wrist inputs fail the check. `pack_session.py` includes the effective
+map and identifies it for the receiver; any downstream dataset builder must
+honor that map's family, IDs and sizes. On recordings without a snapshot,
+both commands accept `--marker-map PATH`, otherwise use the legacy unit map.
+
+Changing wrist markers requires fresh **width holds** to verify visibility
+and metric accuracy across apertures: marker-center separation is not the
+jaw gap. It does not require new camera intrinsics if the lens and capture
+settings stay unchanged.
+
 **Width holds — once per unit, not per session.** The first session on a new
 glove unit (and any session after you move or reprint the tip/back markers)
 runs with `--width_holds`. At the first prompt, clamp the jaws on a rigid
@@ -126,6 +298,86 @@ markers at every hold (check with `tag_contrast.py` first). Holds land in
 as raw mm unless `calib/gap_to_actuator.json` exists (that file comes from a
 robot bench measurement and maps mm to the robot's gripper units — we
 supply it).
+
+**Offline metric forward-width review.** `forward_width_check.py` uses existing
+forward detection caches and raw-mm width holds. It trains only on the first
+recording, freezes a separate model, then replays a different aperture from the
+second recording. Intrinsics, ball/base geometry, marker maps and capture
+settings remain unchanged. For the Yuan recordings:
+
+```bash
+.venv/bin/python scripts/forward_width_check.py \
+  glove_yuan_width_02 glove_yuan_width_verify_01 --unit yuan \
+  --out tmp/forward_width_yuan_v4.local.json
+```
+
+The learned model jointly fits moving/fixed tag corners rather than subtracting
+two independently estimated tag depths. Candidate references must be within
+50 mm at the closed hold and observed at three widths; a time-blocked training
+holdout applies physical-mm error gates. The final independent gates remain
+coverage >=70%, absolute median error <=1 mm, and p95 absolute error <=2 mm.
+Missing detections, rejected solves and missing body poses remain in the
+coverage denominator. Exit status 2 means this accuracy review failed, with the
+report and frozen model still saved under `tmp/`. Predictions are not clipped or
+smoothed. Static-hold success does not verify moving-width accuracy. This is a
+physical-mm offline path; it does not replace `labels_lib.py`'s normalized robot
+actuator mapping or install a model into the robot pipeline.
+
+Joint solves above the 1 px Huber residual scale retry SQPnP initializations at
+three positions along the trained stroke, choosing the lowest-cost converged
+positive-depth solution. These are starting points, not width bounds. New models
+store per-pair training-blocked p95 scores: the best visible candidate per fixed
+reference contributes one vote before taking a median across references. Missing
+faces use the next ranked candidate; historical models without scores retain
+their flat-median fusion. Reports record solver policy and implementation hashes.
+The current 57.9 mm replay reaches p95 2.084 mm against the unchanged 2 mm gate;
+it remains a failed review. See [progress](../docs/forward-width-progress.md).
+
+The subsequent measured-size Yosub v3 baseline reaches 2.167 mm P95 on the same
+independent 57.9 mm hold. On 2026-10-13 the user selected that preserved baseline
+and accepted a **2.2 mm static P95 limit**, retaining 70% coverage and 1 mm median
+bias limits. `forward_width_accept.py` replays an existing frozen model under an
+explicit policy without refitting or modifying historical 2 mm reports:
+
+```bash
+.venv/bin/python scripts/forward_width_accept.py glove_yuan_width_verify_01 \
+  --model tmp/forward_width_measured_yosub_v3.local.model.json \
+  --p95-max-mm 2.2 \
+  --out tmp/forward_width_measured_yosub_v3_acceptance_repeat.local.json
+```
+
+Use a fresh output name for each review. Historical dataset names remain
+`glove_yuan_*`, while the frozen model records physical unit `yosub`. This static
+acceptance is separate from the unchanged training-candidate gates and does not
+qualify the recorded larger-turn failures. The next step is one short normal
+glove episode to inspect moving-marker coverage and width continuity, using a
+fresh dataset name. This acceptance does not install the metric model into the
+legacy normalized actuator pipeline.
+
+For moving recordings, `forward_width_quality_check.py` layers an explicit
+numerical quality policy over the frozen solver. It rejects ill-conditioned
+pair candidates **before** selecting the best training-ranked face for each
+fixed reference, so a usable face can still provide a fallback. The score is
+`max(corner_noise_floor_px, rms_px) * std_mm_per_pixel`; it is a numerical
+diagnostic, not an absolute error bound. Derive policy limits from training
+diagnostics, then freeze the policy and model hashes before reviewing motion.
+
+```sh
+python scripts/forward_width_quality_check.py <dataset> \
+  --model tmp/<frozen-model>.json \
+  --quality-policy calib/<quality-policy>.local.json \
+  --out tmp/<fresh-motion-review>.json
+```
+
+Width-hold recordings additionally require an explicit `--p95-max-mm`. The
+report retains raw and qualified arrays, per-pair rejection reasons, coverage
+and adjacent valid-frame steps. Missing/rejected frames remain NaN; no temporal
+averaging, interpolation, clipping or refitting occurs. Receiver replay resolves
+the frozen geometry within its own checkout and verifies the recorded hashes;
+historical absolute provenance paths are not active fallback inputs. See the
+[moving-width review](../docs/forward-width-progress.md) for measured coverage
+tradeoffs and the remaining view-dependent bias. Local models, policies,
+calibration and recordings must be transferred separately from Git.
 
 Also record one **calibration take** per unit (`--num_episodes 1`): a single
 long episode slowly rotating the ball through every orientation at working
@@ -199,7 +451,8 @@ repository root.
 | `pack_session.py <dataset> … --unit <unit> [--dest]` | hand-off manifest + rsync line (sessions are 7–14 GB) | 4b |
 
 Libraries (not commands): `labels_lib.py` — the label stack (fused ball
-pose, body-frame aperture estimators); `uvc_ritual.py` — per-camera
+pose, body-frame aperture estimators); `forward_width.py` — physical-mm
+tail/base image constraints for the offline width review; `uvc_ritual.py` — per-camera
 exposure/gain/focus controls, selected by device name.
 
 ## Where to edit

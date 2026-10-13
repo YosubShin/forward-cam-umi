@@ -23,6 +23,11 @@ Two commands:
             calib/<stem>_cam_world.json (T_cam_world = world expressed in the
             camera frame, 4x4, metres) and prints the residuals.
 
+Optional marker_edges_mm maps string IDs to measured square-edge lengths.
+These override the uniform edge_mm fallback and are preserved in new layouts.
+Raw horizontal/vertical readings may accompany measurement_revision; using
+their mean remains a square approximation, not a rectangular shape calibration.
+
 Usage:
   python scripts/tiles_pose.py layout <stem> --intr calib/B0587_intrinsics.json \
       --tags calib/tags36h11_<unit>.json --name pilot [--origin 5 --xref 4] [--stride 50]
@@ -46,6 +51,15 @@ ROOT = Path(__file__).parent.parent.resolve()   # the tree the script was invoke
 def tag_obj(edge_m):
     h = edge_m / 2
     return np.array([[-h, h, 0], [h, h, 0], [h, -h, 0], [-h, -h, 0]], float)
+
+
+def tag_edge_mm(config, marker_id):
+    """Resolve one measured square edge, retaining legacy uniform layouts."""
+    edges = config.get("marker_edges_mm", {})
+    edge = float(edges[str(marker_id)] if str(marker_id) in edges else config["edge_mm"])
+    if not np.isfinite(edge) or edge <= 0:
+        raise ValueError(f"Tile {marker_id}: black-edge length must be positive and finite")
+    return edge
 
 
 def detector():
@@ -89,11 +103,10 @@ def to_T(rv, tv):
 
 def cmd_layout(a):
     K, dist = L.load_intrinsics(a.intr)
-    tags = json.load(open(a.tags))
+    with Path(a.tags).open() as stream:
+        tags = json.load(stream)
     ids_ok = set(int(i) for i in tags["ids"])
-    edge = tags["edge_mm"] / 1000.0
     det = detector()
-    obj = tag_obj(edge)
     poses = {}
     n_frames = 0
     for k, g in sample_frames(a.stem, a.stride):
@@ -105,6 +118,7 @@ def cmd_layout(a):
             i = int(i)
             if i not in ids_ok:
                 continue
+            obj = tag_obj(tag_edge_mm(tags, i) / 1000.0)
             ok, rv, tv = cv2.solvePnP(obj, c.reshape(4, 2).astype(float), K, dist,
                                       flags=cv2.SOLVEPNP_IPPE_SQUARE)
             if ok:
@@ -142,6 +156,12 @@ def cmd_layout(a):
                        f"+z = tile normal (up); +y = z cross x. Units mm.",
               "source": {"stem": a.stem, "intrinsics": a.intr, "frames_sampled": n_frames},
               "tiles": {}}
+    # Carry measured edges into the layout: solve_frame must project the same
+    # per-ID geometry that was used to estimate the tile positions.
+    if "marker_edges_mm" in tags:
+        layout["marker_edges_mm"] = {str(i): tag_edge_mm(tags, i) for i in med}
+    if "measurement_revision" in tags:
+        layout["measurement_revision"] = tags["measurement_revision"]
     for i, (T, n, spread) in sorted(med.items()):
         Tw = T_world_cam @ T
         layout["tiles"][str(i)] = {"xyz_mm": (Tw[:3, 3] * 1000).round(1).tolist(),
@@ -149,7 +169,8 @@ def cmd_layout(a):
                                    "frames": n, "spread_mm": round(spread, 1)}
     layout["T_cam_world_source"] = T_cam_world.tolist()
     out = ROOT / f"calib/workspace_tiles_{a.name}.json"
-    json.dump(layout, open(out, "w"), indent=1)
+    with out.open("w") as stream:
+        json.dump(layout, stream, indent=1)
     print(f"\nlayout (mm, world frame):")
     for i, t in layout["tiles"].items():
         print(f"  tile {i}: x {t['xyz_mm'][0]:7.1f}  y {t['xyz_mm'][1]:7.1f}  z {t['xyz_mm'][2]:6.1f}")
@@ -164,13 +185,12 @@ def cmd_layout(a):
 
 def solve_frame(corners_by_id, layout, K, dist):
     """Multi-tile PnP: all corners of all decoded tiles vs world coordinates."""
-    edge = layout["edge_mm"] / 1000.0
-    obj_t = tag_obj(edge)
     O, I = [], []
     for i, c in corners_by_id.items():
         t = layout["tiles"].get(str(i))
         if t is None:
             continue
+        obj_t = tag_obj(tag_edge_mm(layout, i) / 1000.0)
         Tw = to_T(t["rvec"], np.array(t["xyz_mm"]) / 1000.0)
         O.append((Tw[:3, :3] @ obj_t.T).T + Tw[:3, 3])
         I.append(c.reshape(4, 2).astype(float))
@@ -179,14 +199,25 @@ def solve_frame(corners_by_id, layout, K, dist):
 
     def fit(Os, Is):
         Oc, Ic = np.concatenate(Os), np.concatenate(Is)
-        flags = cv2.SOLVEPNP_IPPE_SQUARE if len(Oc) == 4 else cv2.SOLVEPNP_SQPNP
-        ok, rv, tv = cv2.solvePnP(Oc, Ic, K, dist, flags=flags)
+        # These are WORLD corners, including a single translated/rotated tile.
+        # IPPE_SQUARE accepts only its centred canonical square; SQPnP supports
+        # these world coordinates without violating that object-point contract.
+        ok, rv, tv = cv2.solvePnP(Oc, Ic, K, dist, flags=cv2.SOLVEPNP_SQPNP)
         if not ok:
             return None
         if len(Oc) > 4:
-            ok, rv, tv = cv2.solvePnP(Oc, Ic, K, dist, rvec=rv, tvec=tv, useExtrinsicGuess=True,
-                                      flags=cv2.SOLVEPNP_ITERATIVE)
+            refined, rv2, tv2 = cv2.solvePnP(Oc, Ic, K, dist, rvec=rv.copy(), tvec=tv.copy(),
+                                           useExtrinsicGuess=True, flags=cv2.SOLVEPNP_ITERATIVE)
+            if refined:
+                rv, tv = rv2, tv2
+        if not np.isfinite(rv).all() or not np.isfinite(tv).all():
+            return None
+        camera_points = Oc @ cv2.Rodrigues(rv)[0].T + tv.ravel()
+        if np.any(camera_points[:, 2] <= 0):
+            return None
         proj, _ = cv2.projectPoints(Oc, rv, tv, K, dist)
+        if not np.isfinite(proj).all():
+            return None
         per_tile = np.sqrt(((proj.reshape(-1, 2) - Ic) ** 2).sum(1)).reshape(-1, 4).mean(1)
         return rv, tv, per_tile
 
@@ -209,8 +240,10 @@ def solve_frame(corners_by_id, layout, K, dist):
 
 def cmd_solve(a):
     K, dist = L.load_intrinsics(a.intr)
-    layout = json.load(open(a.layout))
-    tags = json.load(open(a.tags))
+    with Path(a.layout).open() as stream:
+        layout = json.load(stream)
+    with Path(a.tags).open() as stream:
+        tags = json.load(stream)
     ids_ok = set(int(i) for i in tags["ids"])
     det = detector()
     Ts, rms, nt, ks = [], [], [], []
@@ -236,24 +269,30 @@ def cmd_solve(a):
           f"median {np.median(dev):.1f} mm, p90 {np.percentile(dev, 90):.1f} mm")
     print(f"  camera in world (mm): {np.round(np.linalg.inv(T_med)[:3, 3] * 1000, 1)}")
     out = ROOT / f"calib/{a.stem}_cam_world.json"
-    json.dump({"stem": a.stem, "layout": a.layout, "T_cam_world": T_med.tolist(),
-               "n_frames": len(Ts), "rms_px_median": float(np.median(rms)),
-               "pos_spread_mm_median": float(np.median(dev)),
-               "per_frame": [{"k": int(k), "T_cam_world": T.tolist(), "rms": float(e), "tiles": int(n)}
-                             for k, T, e, n in zip(ks, Ts, rms, nt)] if a.per_frame else None},
-              open(out, "w"), indent=1)
+    with out.open("w") as stream:
+        json.dump({"stem": a.stem, "layout": a.layout, "T_cam_world": T_med.tolist(),
+                   "n_frames": len(Ts), "rms_px_median": float(np.median(rms)),
+                   "pos_spread_mm_median": float(np.median(dev)),
+                   "per_frame": [{"k": int(k), "T_cam_world": T.tolist(), "rms": float(e), "tiles": int(n)}
+                                 for k, T, e, n in zip(ks, Ts, rms, nt)] if a.per_frame else None},
+                  stream, indent=1)
     print(f"wrote {out}")
 
 
-ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-sub = ap.add_subparsers(dest="cmd", required=True)
-p1 = sub.add_parser("layout")
-p1.add_argument("stem"); p1.add_argument("--intr", required=True); p1.add_argument("--tags", required=True)
-p1.add_argument("--name", required=True); p1.add_argument("--origin", type=int, default=5)
-p1.add_argument("--xref", type=int, default=4); p1.add_argument("--stride", type=int, default=50)
-p2 = sub.add_parser("solve")
-p2.add_argument("stem"); p2.add_argument("--intr", required=True); p2.add_argument("--tags", required=True)
-p2.add_argument("--layout", required=True); p2.add_argument("--stride", type=int, default=50)
-p2.add_argument("--per-frame", action="store_true", help="keep every sampled frame's pose (moving camera)")
-a = ap.parse_args()
-cmd_layout(a) if a.cmd == "layout" else cmd_solve(a)
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p1 = sub.add_parser("layout")
+    p1.add_argument("stem"); p1.add_argument("--intr", required=True); p1.add_argument("--tags", required=True)
+    p1.add_argument("--name", required=True); p1.add_argument("--origin", type=int, default=5)
+    p1.add_argument("--xref", type=int, default=4); p1.add_argument("--stride", type=int, default=50)
+    p2 = sub.add_parser("solve")
+    p2.add_argument("stem"); p2.add_argument("--intr", required=True); p2.add_argument("--tags", required=True)
+    p2.add_argument("--layout", required=True); p2.add_argument("--stride", type=int, default=50)
+    p2.add_argument("--per-frame", action="store_true", help="keep every sampled frame's pose (moving camera)")
+    a = ap.parse_args()
+    cmd_layout(a) if a.cmd == "layout" else cmd_solve(a)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,6 @@
+-r requirements.txt
+# Native device identity and frame delivery; installed only on macOS.
+pyobjc-framework-AVFoundation>=10; sys_platform == "darwin"
+pyobjc-framework-CoreMedia>=10; sys_platform == "darwin"
+pyobjc-framework-Quartz>=10; sys_platform == "darwin"
+pyobjc-framework-libdispatch>=10; sys_platform == "darwin"

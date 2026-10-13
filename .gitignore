@@ -12,3 +12,18 @@ calib/*_detections.*
 calib/*.npz
 calib/tmp_*
 __pycache__/
+
+# Local Python environment and physical-device bindings (examples are tracked).
+.venv/
+calib/cameras.json
+calib/cameras.json.bak-*
+calib/*.local.json
+# Per-camera calibration results and their backups belong to the capture unit.
+calib/*_intrinsics.json
+calib/*_intrinsics.json.bak-*
+calib/*.npz.bak-*
+# Generated capture-unit geometry and offline review/package outputs.
+calib/*_cam_world.json
+calib/glove_*_dodeca_bundle.json
+calib/glove_*_gripper_bundle.json
+/tmp/

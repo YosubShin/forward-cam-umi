@@ -126,4 +126,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if sys.platform == "darwin":
+        from cameras_setup_macos import main as macos_main
+        macos_main()
+    else:
+        main()

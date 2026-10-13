@@ -33,6 +33,8 @@ import threading
 import time
 from pathlib import Path
 
+from marker_config import WristMarkers, load_marker_map, resolve_marker_map, save_snapshot
+
 # Resolve the DIRECTORY, not the file: this script may be reached through a
 # symlink from another working tree (pilot/scripts -> forward-cam-umi), and
 # the data/calib roots must belong to the tree it was invoked from.
@@ -57,7 +59,7 @@ CAMERAS = [
 # the table above — a list of [suffix, by_path, name_fragment_or_null, "WxH",
 # "fps"]. Find by-path links with `ls -l /dev/v4l/by-path/`.
 _CAM_JSON = PILOT / "calib/cameras.json"
-if _CAM_JSON.exists():
+if sys.platform != "darwin" and _CAM_JSON.exists():
     CAMERAS = [tuple(c) for c in json.load(open(_CAM_JSON))]
     print(f"cameras from {_CAM_JSON.name}: {[c[0] for c in CAMERAS]}")
 
@@ -106,7 +108,9 @@ def _tail_frame(stem):
     segs = sorted((PILOT / "data/raw").glob(f".{stem}_seg*.mkv"))
     if not segs or segs[-1].stat().st_size < 500_000:
         return None
-    raw = segs[-1].read_bytes()[-30_000_000:]
+    with segs[-1].open("rb") as f:
+        f.seek(max(0, segs[-1].stat().st_size - 30_000_000))
+        raw = f.read()
     i2 = raw.rfind(b"\xff\xd8\xff")
     i1 = raw.rfind(b"\xff\xd8\xff", 0, max(i2, 0))
     i = i1 if i1 >= 0 else i2
@@ -120,13 +124,16 @@ def _tail_frame(stem):
 _DETS = {}
 
 
-def _frame_health(stem, img):
-    """(brightness mean, decoded fiducial count). The marker count is the
+def _frame_health(stem, img, wrist_markers=None):
+    """(brightness, marker count, black level, contrast). The marker count is the
     FUNCTIONAL check: exposure, focus, lens smudge, and framing all gate
     it, and the rig guarantees markers in view (dodeca/tails for the
-    forward cams, 16h5 tips for the wrist fisheye)."""
+    forward cams, configured tips for the wrist fisheye). Without a map,
+    keep the legacy any-16h5 wrist check."""
     import cv2
-    kind = "16h5" if "fish" in stem else "4x4"
+    wrist = stem.endswith("_fish")
+    expected = wrist_markers if wrist else None
+    kind = expected.family if expected else ("16h5" if wrist else "4x4")
     if kind not in _DETS:
         p = cv2.aruco.DetectorParameters()
         p.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_APRILTAG
@@ -138,6 +145,13 @@ def _frame_health(stem, img):
     corners, ids, _ = _DETS[kind].detectMarkers(gray)
     if ids is None or not len(ids):
         return float(gray.mean()), 0, None, None
+    if expected:
+        # Count only the configured pair. Unrelated tags and duplicate IDs
+        # cannot stand in for a missing jaw marker.
+        from collections import Counter
+        counts = Counter(int(i) for i in ids.ravel())
+        corners = [c for c, i in zip(corners, ids.ravel())
+                   if int(i) in expected.sizes_mm and counts[int(i)] == 1]
     # contrast at the decoded markers: a stuck ISP (seen on the wrist
     # fisheye, fixed only by replugging) lifts the black cells to ~180 while
     # the frame mean looks normal and a tag or two still decodes — the
@@ -153,9 +167,19 @@ def _frame_health(stem, img):
             b, w = _np.percentile(v, 5), _np.percentile(v, 95)
             blacks.append(b)
             contrasts.append(w - b)
-    return (float(gray.mean()), len(ids),
+    return (float(gray.mean()), len(corners),
             float(max(blacks)) if blacks else None,
             float(min(contrasts)) if contrasts else None)
+
+
+def _required_markers(stem, wrist_markers):
+    return len(wrist_markers.markers) if wrist_markers and stem.endswith("_fish") else 1
+
+
+def _marker_expectation(stem, wrist_markers):
+    if wrist_markers and stem.endswith("_fish"):
+        return wrist_markers.description
+    return "16h5 markers" if stem.endswith("_fish") else "4x4 markers"
 
 
 # Fail thresholds. Measured 2026-10-06 on real frames: stuck-ISP wrist cam
@@ -174,7 +198,62 @@ def _washed(black, contrast):
                  or (contrast < WASHED_CONTRAST and black > 100)))
 
 
-def _janitor(dataset, stems, stop_ev, seg_secs=60, keep_recent=300, margin=30):
+def _stop_recorders(recs):
+    """Reap children even on startup/pre-flight failure; preserve their remux."""
+    for _, proc, _ in recs:
+        if proc.poll() is None:
+            proc.send_signal(signal.SIGTERM)
+    failed = []
+    for stem, proc, log in recs:
+        try:
+            code = proc.wait(timeout=1800)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            code = -1
+        if code:
+            failed.append(stem)
+        if not log.closed:
+            log.close()
+    return failed
+
+
+def _recorder_failure(stem, code, log_path):
+    """Surface the child's actual error instead of guessing a device fault."""
+    detail = "no recorder output; inspect the log"
+    try:
+        with open(log_path, "rb") as log:
+            log.seek(0, os.SEEK_END)
+            log.seek(max(0, log.tell() - 8192))
+            lines = log.read().decode("utf-8", errors="replace").splitlines()
+        detail = next((line.strip() for line in reversed(lines) if line.strip()), detail)
+    except OSError:
+        pass
+    return f"{stem} exited with code {code}: {detail}\n  log: {log_path}"
+
+
+def _disk_budget_gb(cameras, *, is_macos, duration, num_episodes, episode_time):
+    """Return required free space and the assumptions shown to the operator."""
+    if is_macos and duration is not None:
+        # Budget 0.5 compressed bytes/pixel for quality-95 MJPEG, scaled to
+        # the selected modes. This is an estimate, not an encoder size cap;
+        # the runtime watchdog also reserves the measured remux copy.
+        bytes_per_second = 0.0
+        for _, _, _, resolution, fps in cameras:
+            width, height = map(int, resolution.split("x"))
+            bytes_per_second += width * height * float(fps) * 0.5
+        required = bytes_per_second * (duration + 30) * 2 / 1e9 + 2
+        return required, (f"{duration:g}s capture + 30s startup budget, selected camera modes, "
+                          "two video copies for remux + 2 GB reserve; MJPEG size is scene-dependent")
+    # Keep the original Linux/untimed-session policy; report its actual
+    # floor instead of claiming that freeing only the estimate is enough.
+    estimate = num_episodes * (episode_time + 30) / 60 * 1.0 * 2
+    return max(estimate, 30), (f"~{estimate:.1f} GB session estimate including remux; "
+                               "30 GB minimum for untimed/standard sessions")
+
+
+def _janitor(dataset, stems, stop_ev, seg_secs=60, keep_recent=300, margin=30,
+             wrist_markers=None):
     """Prune idle camera segments: anything older than keep_recent seconds
     that overlaps no saved episode (±margin) gets deleted, so pauses and
     between-episode time never accumulate on disk. The 2 newest segments per
@@ -212,8 +291,8 @@ def _janitor(dataset, stems, stop_ev, seg_secs=60, keep_recent=300, margin=30):
                 try:
                     img = _tail_frame(stem)
                     if img is not None:
-                        m, nmk = _frame_health(stem, img)
-                        bad = nmk == 0
+                        m, nmk, _, _ = _frame_health(stem, img, wrist_markers)
+                        bad = nmk < _required_markers(stem, wrist_markers)
                         bad_streak[stem] = bad_streak.get(stem, 0) + 1 \
                             if bad else 0
                         if bad:
@@ -275,6 +354,13 @@ def main():
                     help="skeleton only (debug)")
     ap.add_argument("--no_preview", action="store_true",
                     help="disable the live preview windows")
+    ap.add_argument("--config", default=None,
+                    help="macOS camera bindings (default calib/cameras.macos.local.json)")
+    ap.add_argument("--marker-map", default=None,
+                    help="physical marker map: wrist family, two IDs and black-edge sizes; "
+                         "saved with the session (default reuse its snapshot, otherwise legacy checks)")
+    ap.add_argument("--duration", type=float, default=None,
+                    help="stop a --cameras_only rehearsal after this many seconds of pre-flight-checked capture")
     ap.add_argument("--cameras", default="b0587,b0587b,fish",
                     help="comma list of camera suffixes to record "
                          "(e.g. b0587,b0587b when the wrist cam is removed)")
@@ -284,6 +370,29 @@ def main():
                          "mount; default none = landscape). Recording is "
                          "unaffected")
     args, extra = ap.parse_known_args()
+    is_macos = sys.platform == "darwin"
+    if args.duration is not None and (not args.cameras_only or args.glove
+                                      or not 0 < args.duration < float("inf")):
+        ap.error("--duration requires --cameras_only without --glove, and a positive finite duration")
+    if is_macos and not (args.glove or args.cameras_only):
+        ap.error("macOS currently supports --glove and --cameras_only; robot recording is not ported")
+    if args.config is not None and not is_macos:
+        ap.error("--config is for macOS; Linux uses calib/cameras.json")
+    camera_config = None
+    cameras = CAMERAS
+    if is_macos:
+        from camera_config import DEFAULT_CONFIG, load_config
+        from camera_macos import resolve_device
+        camera_config = str(Path(args.config or DEFAULT_CONFIG).resolve())
+        specs = load_config(camera_config)
+        cameras = [(s.role, s.device_id, None, f"{s.width}x{s.height}", str(s.fps)) for s in specs]
+    wanted = {c.strip() for c in args.cameras.split(",") if c.strip()}
+    unknown = wanted - {c[0] for c in cameras}
+    if unknown:
+        raise SystemExit(f"unknown camera suffix(es) {sorted(unknown)} — "
+                         f"known: {[c[0] for c in cameras]}")
+    if not wanted:
+        ap.error("--cameras must select at least one camera")
 
     # the teleop recorder puts the tty in raw/no-echo mode for its
     # single-key controls; every abnormal exit (Ctrl-C races included) must
@@ -307,6 +416,18 @@ def main():
         if not args.cameras_only:
             raise SystemExit("--dataset is required (or use --cameras_only)")
         args.dataset = "rehearsal"
+    if is_macos:
+        from recording_io import validate_stem
+        validate_stem(args.dataset)
+
+    try:
+        marker_path = resolve_marker_map(PILOT, args.dataset, path=args.marker_map)
+        marker_map = load_marker_map(marker_path) if marker_path else None
+        wrist_markers = WristMarkers.from_map(marker_map) if marker_map else None
+    except (OSError, ValueError) as exc:
+        ap.error(str(exc))
+    if wrist_markers:
+        print(f"wrist markers: {wrist_markers.description}; both required (from {marker_path})")
 
     # dataset-dir state must match the resume flag BEFORE cameras spin up:
     # a shell dir from a crashed run breaks both create (FileExists) and
@@ -327,17 +448,20 @@ def main():
                "but holds no episodes (crashed run) — delete it: "
                f"rm -rf {droot}"))
 
-    # ---- disk: ~1 GB/min continuous (4K25 + fisheye), 2x peak during remux --
+    # ---- disk: reserve both segment and remux copies before opening cameras --
     import shutil
     free_gb = shutil.disk_usage(PILOT / "data/raw").free / 1e9
-    est_gb = args.num_episodes * (args.episode_time + 30) / 60 * 1.0 * 2
-    if free_gb < max(est_gb, 30):
+    required_gb, disk_basis = _disk_budget_gb(
+        [c for c in cameras if c[0] in wanted], is_macos=is_macos,
+        duration=args.duration, num_episodes=args.num_episodes, episode_time=args.episode_time)
+    if free_gb < required_gb:
         raise SystemExit(
-            f"only {free_gb:.0f} GB free — session needs ~{est_gb:.0f} GB "
-            "(cameras record CONTINUOUSLY, ~1 GB/min, and remux doubles the "
-            "peak). Free space or shorten the session.")
-    print(f"disk: {free_gb:.0f} GB free (~1 GB/min while cameras roll; a "
-          "janitor prunes idle footage >5 min old that belongs to no episode)")
+            f"only {free_gb:.2f} GB free — required budget {required_gb:.2f} GB "
+            f"({disk_basis}). Free space or shorten the session.")
+    print(f"disk: {free_gb:.2f} GB free; required budget {required_gb:.2f} GB ({disk_basis}).")
+    if is_macos:
+        print("macOS: high-quality MJPEG re-encode; disk rate depends on the scene. "
+              "Exposure/gain are NOT controlled. Validate a short take before collection.")
 
     # ---- host reachable? -----------------------------------------------------
     if not args.cameras_only:
@@ -353,11 +477,13 @@ def main():
 
     # ---- camera recorders ----------------------------------------------------
     recs = []   # (stem, Popen, logfile)
-    wanted = {c.strip() for c in args.cameras.split(",") if c.strip()}
-    unknown = wanted - {c[0] for c in CAMERAS}
-    if unknown:
-        raise SystemExit(f"unknown camera suffix(es) {sorted(unknown)} — "
-                         f"known: {[c[0] for c in CAMERAS]}")
+    atexit.register(_stop_recorders, recs)
+    if is_macos and not args.skip_cameras:
+        for spec in specs:
+            if spec.role in wanted:
+                device = resolve_device(spec.device_id)
+                if str(device.localizedName()) != spec.name:
+                    raise SystemExit(f"{spec.role}: saved device name changed; rerun camera setup")
     if not args.skip_cameras:
         def _bail(msg):
             # abort DURING the launch loop: recorders already started for
@@ -369,7 +495,7 @@ def main():
             raise SystemExit(msg)
 
         # zombie check for EVERY wanted stem before launching any of them
-        for suffix, *_ in CAMERAS:
+        for suffix, *_ in cameras:
             if suffix not in wanted:
                 continue
             stem0 = f"{args.dataset}_{suffix}"
@@ -380,14 +506,17 @@ def main():
                     f"a recorder for {stem0} is already running (pid "
                     f"{', '.join(alive)}) — stop it first: kill -TERM "
                     f"{' '.join(alive)}  (it will finish its remux), then rerun")
-        for suffix, bypath, frag, res, fps in CAMERAS:
+        if marker_map is not None:
+            saved = save_snapshot(PILOT, args.dataset, marker_map)
+            print(f"session marker map: {saved}")
+        for suffix, bypath, frag, res, fps in cameras:
             if suffix not in wanted:
                 continue
-            dev = bypath if os.path.exists(bypath) else \
+            dev = bypath if is_macos or os.path.exists(bypath) else \
                 (find_dev(frag) if frag else None)
-            if dev is None and suffix == "b0587b":
+            if not is_macos and dev is None and suffix == "b0587b":
                 # glasses cam: its port changes with the cable route
-                dev = find_other_b0587({c[1] for c in CAMERAS
+                dev = find_other_b0587({c[1] for c in cameras
                                         if c[0] != suffix})
                 if dev:
                     print(f"  b0587b resolved by exclusion at {dev} "
@@ -438,6 +567,8 @@ def main():
             primary = suffix == "b0587"
             show = (primary or args.preview_all) and not args.no_preview
             env = dict(os.environ, PREVIEW="1" if show else "0")
+            if is_macos:
+                env["UMI_CAMERA_CONFIG"] = camera_config
             if primary and args.forward_rotate != "none":
                 env["ROTATE"] = args.forward_rotate
             if primary:
@@ -454,38 +585,39 @@ def main():
             recs.append((stem, p, log))
             print(f"recording {stem}: {dev} @ {res}x{fps} (log: {log.name})")
         time.sleep(4.0)  # streams up + rituals latched
-        for stem, p, _ in recs:
+        for stem, p, log in recs:
             if p.poll() is not None:
                 for _, q, _ in recs:
                     if q.poll() is None:
                         q.send_signal(signal.SIGTERM)
-                raise SystemExit(f"{stem} recorder died at startup — see its log")
+                raise SystemExit(_recorder_failure(stem, p.returncode, log.name))
         # behavioral exposure pre-flight: control READBACK LIES (latch race —
         # the 2026-09-11 fish session read back e=2 yet recorded mean 236/255
         # blown-white for 27 episodes). Decode a real frame from each
         # camera's first segment and refuse to run on a blown/black stream.
         # Known-good scene means run 94-156; blown ~236.
         time.sleep(5.0)  # streams up AND ritual latched (~1.5s in)
-        dead = [(stem, q.returncode) for stem, q, _ in recs if q.poll() is not None]
+        dead = [_recorder_failure(stem, q.returncode, log.name)
+                for stem, q, log in recs if q.poll() is not None]
         if dead:
             for _, q, _ in recs:
                 if q.poll() is None:
                     q.send_signal(signal.SIGTERM)
-            raise SystemExit(
-                f"recorder(s) died at startup: {dead} — device busy (a "
-                "recorder from an earlier run still alive? `pgrep -af "
-                "uvc_record.py`) or wrong device node; see the stem's "
-                "_recorder.log")
+            raise SystemExit("recorder(s) stopped during startup:\n" + "\n".join(dead))
 
         def _health(stem):
             for _ in range(10):
+                dead = [_recorder_failure(s, p.returncode, log.name)
+                        for s, p, log in recs if p.poll() is not None]
+                if dead:
+                    _abort("recorders stopped during pre-flight:\n" + "\n".join(dead))
                 img = _tail_frame(stem)
                 if img is not None:
-                    return _frame_health(stem, img)
+                    return _frame_health(stem, img, wrist_markers)
                 time.sleep(1.0)
             return None, None, None, None
 
-        devs = {f"{args.dataset}_{s}": d for s, d, *_ in CAMERAS}
+        devs = {f"{args.dataset}_{s}": d for s, d, *_ in cameras}
 
         def _abort(msg):
             for _, q, _ in recs:
@@ -498,7 +630,8 @@ def main():
             # a few seconds in is a valid health check. On a glove session
             # NOTHING is in view until the operator holds the glove up, so
             # wait for every stream instead of aborting on the first frame.
-            from uvc_ritual import apply as _ritual
+            if not is_macos:
+                from uvc_ritual import apply as _ritual
             print("\nGLOVE PRE-FLIGHT — hold the glove where ALL cameras see "
                   "it (fixed forward, glasses, wrist); waiting up to 120 s "
                   "for markers on every stream…", flush=True)
@@ -517,12 +650,12 @@ def main():
                               f" / >= {WASHED_CONTRAST:.0f}) — REPLUG this "
                               "camera; a brightness/exposure tweak will not "
                               "fix it", flush=True)
-                    elif nmk:
+                    elif nmk is not None and nmk >= _required_markers(stem, wrist_markers):
                         print(f"  {stem}: {nmk} markers decoded "
                               f"(mean {mean:.0f}/255, tag blacks {black:.0f},"
                               f" contrast {contrast:.0f}) OK", flush=True)
                         pending.discard(stem)
-                    elif (mean is not None and not 25 <= mean <= 210
+                    elif (not is_macos and mean is not None and not 25 <= mean <= 210
                           and stem not in healed and stem in devs):
                         # exposure anomaly: the mid-stream latch race is
                         # transient — re-apply the ritual once
@@ -533,16 +666,20 @@ def main():
                             _ritual(devs[stem])
                         except Exception as e:
                             print(f"  (ritual re-apply failed: {e})")
+                    else:
+                        print(f"  {stem}: {nmk or 0}/{_required_markers(stem, wrist_markers)} "
+                              f"required markers; show {_marker_expectation(stem, wrist_markers)}",
+                              flush=True)
                 if pending:
                     time.sleep(2.0)
             if pending:
-                _abort(f"{sorted(pending)}: no fiducials decoded within 120 s "
+                _abort(f"{sorted(pending)}: required markers not decoded within 120 s "
                        "— is the glove in that camera's view? lens smudge? "
                        "wrong device? (check its preview window)")
 
         for stem, _, _ in ([] if args.glove else recs):
             mean, nmk, black, contrast = _health(stem)
-            if mean is not None and (not 25 <= mean <= 210 or nmk == 0) \
+            if not is_macos and mean is not None and (not 25 <= mean <= 210 or nmk < _required_markers(stem, wrist_markers)) \
                     and stem in devs:
                 # self-heal: the mid-stream latch race is transient — apply
                 # the ritual again on the live stream and re-check before
@@ -557,6 +694,8 @@ def main():
                 time.sleep(3.0)
                 mean, nmk, black, contrast = _health(stem)
             if mean is None:
+                if is_macos:
+                    _abort(f"{stem}: no recorded frame available for pre-flight; check its recorder log")
                 print(f"*** {stem}: no startup frame for the health check — "
                       "verify its preview by eye before recording ***")
                 continue
@@ -566,13 +705,14 @@ def main():
             # bright (healthy scenes near mean 200), so mean alone must
             # never abort a stream that still decodes fiducials
             fail = None
-            if nmk == 0:
+            if nmk < _required_markers(stem, wrist_markers):
                 why = ("blown white" if mean > 210 else
                        "near black" if mean < 25 else
-                       "exposure OK — suspect lens smudge/focus/framing")
-                fail = (f"{stem} HEALTH CHECK FAILED: ZERO fiducials decode "
-                        f"(frame mean {mean:.0f}/255, {why}). Wipe/replug "
-                        "and rerun; markers are always in view on this rig.")
+                       "brightness in range")
+                fail = (f"{stem} HEALTH CHECK FAILED: {nmk}/{_required_markers(stem, wrist_markers)} "
+                        f"required markers decode; expected {_marker_expectation(stem, wrist_markers)} "
+                        f"(frame mean {mean:.0f}/255, {why}). Check the marker map, "
+                        "visibility, focus and lens before retrying.")
             elif _washed(black, contrast):
                 fail = (f"{stem} HEALTH CHECK FAILED: markers decode but the "
                         f"image is WASHED OUT (tag blacks {black:.0f}/255, "
@@ -587,16 +727,38 @@ def main():
                 _abort(fail)
             print(f"{stem}: health OK (mean {mean:.0f}/255, "
                   f"{nmk} markers decoded)")
-        print("all cameras rolling; rituals applied mid-stream\n")
+        print("all cameras rolling; recorded-frame marker checks passed; "
+              "macOS exposure/gain remain uncontrolled\n" if is_macos else
+              "all cameras rolling; rituals applied mid-stream\n")
 
     stop_ev = threading.Event()
+    capture_failed = threading.Event()
+    if recs and is_macos:
+        def _mac_watchdog():
+            # Fail promptly, including while input() waits at an episode
+            # prompt. Reserve the complete second copy needed for remux.
+            while not stop_ev.wait(2.0):
+                dead = [stem for stem, p, _ in recs if p.poll() is not None]
+                size = sum(p.stat().st_size for stem, _, _ in recs
+                           for p in (PILOT / "data/raw").glob(f".{stem}_seg*.mkv"))
+                free = shutil.disk_usage(PILOT / "data/raw").free
+                why = (f"recorders stopped: {dead}" if dead else
+                       "disk space low; stopping while enough remains for remux"
+                       if free < size + 2_000_000_000 else None)
+                if why:
+                    capture_failed.set()
+                    print(f"\a\n!! {why}", flush=True)
+                    os.kill(os.getpid(), signal.SIGINT)
+                    return
+        threading.Thread(target=_mac_watchdog, daemon=True).start()
     if recs and not args.cameras_only:
         # no janitor in rehearsal mode: with no episodes saved, it would
         # prune ALL footage older than 5 min
         threading.Thread(target=_janitor,
                          args=(args.dataset, [s for s, _, _ in recs], stop_ev),
+                         kwargs={"wrist_markers": wrist_markers},
                          daemon=True).start()
-    elif recs and args.glove:
+    elif recs and args.glove and not is_macos:
         # glove mode: no pruning (no skeleton to define episode windows), but
         # the dead-stream alarm is essential — a wrist camera that drops out
         # mid-session must not go unnoticed for 7 minutes (2026-10-06)
@@ -741,8 +903,18 @@ def main():
                 ep += 1
             print(f"\n{len(marks)} episodes marked in {out}")
         elif args.cameras_only:
-            input("REHEARSAL — previews live, everything recording. "
-                  "Enter (or Ctrl-C) to stop + finalize… ")
+            if args.duration is not None:
+                print(f"REHEARSAL — recording {args.duration:g} seconds; then finalizing automatically.", flush=True)
+                end = time.monotonic() + args.duration
+                while time.monotonic() < end:
+                    if any(p.poll() is not None for _, p, _ in recs):
+                        code = 1
+                        print("!! a recorder stopped early; ending rehearsal", flush=True)
+                        break
+                    time.sleep(min(0.5, max(0, end - time.monotonic())))
+            else:
+                input("REHEARSAL — previews live, everything recording. "
+                      "Enter (or Ctrl-C) to stop + finalize… ")
         else:
             code = subprocess.call(
                 [sys.executable, str(TELEOP), "--dataset", args.dataset,
@@ -755,6 +927,8 @@ def main():
         pass
     finally:
         stop_ev.set()
+        if capture_failed.is_set():
+            code = 1
         # from here on, further Ctrl-C must not abort cleanup (tty restore,
         # remux waits) — this also ENFORCES "do not Ctrl-C during remux"
         signal.signal(signal.SIGINT, signal.SIG_IGN)
@@ -762,17 +936,11 @@ def main():
         if recs:
             print("\nstopping camera recorders — remux in progress, "
                   "do NOT Ctrl-C…", flush=True)
-            for _, p, _ in recs:
-                if p.poll() is None:
-                    p.send_signal(signal.SIGTERM)
+            failed = _stop_recorders(recs)
             for stem, p, log in recs:
-                try:
-                    p.wait(timeout=1800)
-                    print(f"  {stem}: done")
-                except subprocess.TimeoutExpired:
-                    print(f"  {stem}: STILL REMUXING after 30 min — leave it; "
-                          f"check {log.name}")
-                log.close()
+                print(f"  {stem}: {'FAILED — see recorder log' if stem in failed else 'done'}")
+            if failed:
+                code = 1
 
     # recorders must be GONE now, or the next run will read their segments
     # as its own (2026-10-06: three runs shared one survivor)
@@ -787,8 +955,14 @@ def main():
     if recs:
         stems = "  ".join(s for s, _, _ in recs)
         print(f"camera stems: {stems}")
-        print("next: detect_dodeca on both stems, then build_dataset.py "
-              "(COLLECTION_RUNBOOK.md)")
+        if is_macos:
+            selected = ",".join(c[0] for c in cameras if c[0] in wanted)
+            print(f"next: python scripts/recording_check.py {args.dataset} --cameras {selected}")
+        else:
+            print("next: detect_dodeca on both stems, then build_dataset.py "
+                  "(COLLECTION_RUNBOOK.md)")
+    if code:
+        raise SystemExit(code)
 
 
 if __name__ == "__main__":

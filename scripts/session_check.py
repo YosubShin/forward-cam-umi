@@ -11,7 +11,7 @@ it checks the width holds the way the build will use them.
              coverage (both tips decoded), head-cam ball coverage if present;
              flags anything under the build's 70% gate
   holds      per caliper hold: both-tip decode rate and the tip separation
-             (must be flat; separation - gap should be a constant ~17 mm)
+             (must be flat; separation - gap should be constant for this print)
   tiles      forward cam: which workspace tiles decode and how often
 
 Usage:
@@ -33,6 +33,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import labels_lib as L  # noqa: E402
+from marker_config import WristMarkers, load_marker_map, resolve_marker_map
 
 ROOT = Path(__file__).parent.parent.resolve()   # the tree the script was invoked from, not the symlink target
 GATE = 0.70
@@ -47,10 +48,31 @@ def hms(t):
     return time.strftime("%H:%M:%S", time.localtime(t))
 
 
+def wrist_series(root, dataset, wrist_markers, intrinsics):
+    """Marker-center separation in mm, not yet the calibrated jaw gap.
+
+    Read the configured family's cache. Missing/ambiguous members remain
+    NaN and count against width coverage.
+    """
+    root = Path(root)
+    cache = root / "calib" / f"{dataset}_fish_{wrist_markers.cache_tag}_detections.npz"
+    K, dist = L.load_intrinsics(root / intrinsics)
+    with (root / "data/raw" / f"{dataset}_fish_ts.json").open() as stream:
+        ts = json.load(stream)
+    with np.load(cache) as detections:
+        rows = L.body_frames(detections, ts, K, dist, None, None, wrist_markers.sizes_mm)
+    left, right = sorted(wrist_markers.sizes_mm)
+    return (np.array([r["t_wall"] for r in rows]),
+            np.array([np.linalg.norm(r["pb"][left] - r["pb"][right])
+                      if left in r["pb"] and right in r["pb"] else np.nan for r in rows]))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("dataset")
     ap.add_argument("--unit", required=True)
+    ap.add_argument("--marker-map", default=None,
+                    help="map for legacy recordings; default session snapshot, then the unit map")
     ap.add_argument("--forward-intr", default="calib/B0587_intrinsics.json")
     ap.add_argument("--head-intr", default="calib/B0587b_intrinsics.json")
     ap.add_argument("--wrist-intr", default=None, help="default calib/fisheye_glove_<unit>_intrinsics.json")
@@ -58,9 +80,17 @@ def main():
     unit = a.unit
     wrist_intr = a.wrist_intr or f"calib/fisheye_glove_{unit}_intrinsics.json"
     bad = []
+    try:
+        marker_path = resolve_marker_map(ROOT, a.dataset, unit=unit, path=a.marker_map)
+        mm = load_marker_map(marker_path)
+        wrist_markers = WristMarkers.from_map(mm)
+    except (OSError, ValueError) as exc:
+        ap.error(str(exc))
 
     # ---- streams
     print(f"== {a.dataset}")
+    print(f"  marker map: {marker_path}")
+    print(f"  wrist: {wrist_markers.description}")
     tw = {}
     for cam, fps_nom in (("b0587", 25), ("b0587b", 25), ("fish", 30)):
         t = ts_of(f"{a.dataset}_{cam}")
@@ -79,10 +109,8 @@ def main():
     print(f"  {len(eps)} marked episodes, durations {min(e['duration_s'] for e in eps):.1f}-{max(e['duration_s'] for e in eps):.1f} s")
 
     # ---- label stacks
-    mm = json.load(open(ROOT / f"calib/marker_map_glove_{unit}.json"))
     L.TAILS = {int(k): v for k, v in mm["tails"].items()}
     L.BASES = {int(k): v for k, v in mm["bases"].items()}
-    L.TIPS = {int(k): v for k, v in mm["tips"].items()}
     Tb, dobj = L.load_bundle(ROOT / f"calib/glove_{unit}_dodeca_bundle.json")
     extra = L.load_gripper_bundle(ROOT / f"calib/glove_{unit}_gripper_bundle.json")
 
@@ -101,18 +129,13 @@ def main():
     tH = fused_times(f"{a.dataset}_b0587b", a.head_intr) if "b0587b" in tw else None
 
     # wrist tips
-    tip_p = ROOT / f"calib/{a.dataset}_fish_tips16h5_detections.npz"
     tips_t, sep = None, None
-    if tip_p.exists():
-        Kw, dw = L.load_intrinsics(ROOT / wrist_intr)
-        rows = L.body_frames(np.load(tip_p), json.load(open(ROOT / f"data/raw/{a.dataset}_fish_ts.json")),
-                             Kw, dw, None, None, L.TIPS)
-        ta, tb = sorted(L.TIPS)
-        tips_t = np.array([r["t_wall"] for r in rows])
-        sep = np.array([np.linalg.norm(r["pb"][ta] - r["pb"][tb]) if ta in r["pb"] and tb in r["pb"] else np.nan
-                        for r in rows])
-    else:
-        print("  (no wrist tip detections — width coverage not checked)")
+    if "fish" in tw:
+        try:
+            tips_t, sep = wrist_series(ROOT, a.dataset, wrist_markers, wrist_intr)
+        except FileNotFoundError as exc:
+            print(f"  wrist width inputs missing: {exc.filename}")
+            bad.append("wrist width not checked: missing detections, timestamps or intrinsics")
 
     # ---- episodes
     print("\n  ep   start     dur   ball-pose  tips   head-pose")
